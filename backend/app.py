@@ -108,6 +108,9 @@ def validate_csrf():
 
 @app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
+    normalized_filename = filename.replace('\\', '/')
+    if normalized_filename.startswith('claimant/') and session.get('user_role') not in ('Admin', 'Staff'):
+        return jsonify({'error': 'Unauthorized'}), 401
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route('/api/categories', methods=['GET'])
@@ -267,6 +270,7 @@ def report_item():
 @app.route('/api/search', methods=['GET'])
 def search_openItems():
     unarchive_page = request.args.get('unarchive_page', '0') == '1'
+    browse_all = request.args.get('browse_all', '0') == '1'
 
     name_q = request.args.get('name_q', '').strip()
     desc_q = request.args.get('desc_q', '').strip()
@@ -287,9 +291,17 @@ def search_openItems():
     category_code = request.args.get('category_code', '')
     branch_code = request.args.get('branch_code', '')
     location_code = request.args.get('location_code', '')
+
+    if unarchive_page or status == 'closed':
+        if 'user_id' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        if session.get('user_role') not in ('Admin', 'Staff'):
+            return jsonify({'error': 'Forbidden'}), 403
     
     if (
         not unarchive_page and
+        status != 'closed' and
+        not browse_all and
         not name_q and
         not desc_q and
         not category_code and
@@ -434,8 +446,6 @@ def login():
         cursor.execute(query, (username,))
         user = cursor.fetchone()
 
-        print(user)
-
         # Check if user exists AND password hash matches
         if user:
             # find the password-like field in the returned row safely
@@ -484,6 +494,30 @@ def login():
         if 'conn' in locals() and conn.is_connected():
             conn.close()
 
+@app.route('/api/items/<item_code>', methods=['GET'])
+def get_open_item(item_code):
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM vw_openAllItems WHERE item_code = %s",
+            (item_code,)
+        )
+        item = cursor.fetchone()
+        if not item:
+            return jsonify({'error': 'Item not found'}), 404
+        return jsonify(item), 200
+    except Exception:
+        app.logger.exception('Could not load item details')
+        return jsonify({'error': 'Unable to load item details'}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
 @app.route('/api/logout', methods=['POST'])
 def logout():
 
@@ -505,7 +539,8 @@ def auth_status():
             'user': {
                 'user_id': session['user_id'],
                 'user_code': session['user_code'],
-                'username': session['username']
+                'username': session['username'],
+                'user_role': session['user_role']
             }
         }), 200
     return jsonify({'is_authenticated': False}), 200
@@ -575,6 +610,7 @@ def process_item_claim():
         # If anything fails, rollback database alterations instantly to protect data integrity
         if conn:
             conn.rollback()
+        app.logger.exception('Claim submission failed')
         return jsonify({'message': 'Internal Server Error'}), 500
 
     finally:
